@@ -27,6 +27,8 @@ class BilibiliSurfModule(BaseModule):
     """Wraps local BiliWatcher/Bilibili or delegates to a remote CN node fetcher."""
 
     module_id: str = "bilibili_surf"
+    display_name = "B 站巡逻"
+    description = "账号、视频订阅与巡逻日记"
     schedule_options = BiliScheduleOptions
     node_region: NodeRegion = "KR"
     attention_level: AttentionLevel = "MEDIUM"
@@ -49,6 +51,17 @@ class BilibiliSurfModule(BaseModule):
         self.backend_mode: BackendMode = backend_mode
         self.remote_fetcher = remote_fetcher
         self.node_transport = node_transport
+
+    def admin_status(self, request):
+        return {
+            "autonomous": self.watcher.policy.enabled,
+            "backend": self.backend_mode,
+            "cn_delegate": bool(
+                self.settings.node_bili_delegate_enabled
+                and self.node_transport
+                and self.node_transport.connected()
+            ),
+        }
 
     def actions(self) -> tuple[Action, ...]:
         return (
