@@ -74,7 +74,9 @@ class BilibiliSurfModule(BaseModule):
         return (
             Action(
                 name="bili.patrol",
-                description="按既有订阅、凭证、冷却及预算执行一轮巡逻",
+                description=(
+                    "去 B 站首页推荐和关注动态逛一圈，挑 1～2 个感兴趣的视频细看并记下冲浪槽点"
+                ),
                 budget_lane=PATROL_LANE,
                 effortful=True,
                 window="active",
