@@ -30,7 +30,8 @@ from ..budget_policy import PATROL_LANE, paid_lane_available
 from ..generation_policy import Scenario
 from ..models import Message, Video
 from ..roaming_logger import redact_public_summary
-from ..security import Rejected, authorize, clean_text, configured_secrets, safe_output
+from ..security import Rejected, clean_text, configured_secrets, safe_output
+from ..social import owner_target, permits_chat_export
 from ..work_usage import model_work
 from ..world_state import private_event_audience
 from .bili_history import SCHEMA as HISTORY_SCHEMA
@@ -1128,9 +1129,7 @@ class BiliWatcher:
     async def _next_private_topic(self, sessions, session_list, secrets):
         best = None
         for _, msg in session_list:
-            if msg.kind != "private" or not authorize(
-                msg.model_copy(update={"addressed": True}), self.s
-            ):
+            if msg.kind != "private" or not permits_chat_export(msg, self.s, "bilibili_surf"):
                 continue
             try:
                 epoch, turns = await sessions.private_request_window(msg)
@@ -1216,9 +1215,7 @@ class BiliWatcher:
                 topics.setdefault(field, []).append(text)
 
         for _, msg in session_list[:20]:
-            if msg.kind != "group" or not authorize(
-                msg.model_copy(update={"addressed": True}), self.s
-            ):
+            if msg.kind != "group" or not permits_chat_export(msg, self.s, "bilibili_surf"):
                 continue
             try:
                 view = await sessions.dual.view(msg)
@@ -1303,7 +1300,9 @@ class BiliWatcher:
             items.append(entry)
         return items
 
-    async def lookup_watched(self, bvid: str, *, message: Message | None = None) -> dict | None:
+    async def lookup_watched(
+        self, bvid: str, *, message: Message | None = None, limit: int = 360
+    ) -> dict | None:
         if not isinstance(bvid, str) or not re.fullmatch(BVID, bvid):
             return None
         async with self.store.lock:
@@ -1329,7 +1328,7 @@ class BiliWatcher:
                 return None
             actions = await self._actions_by_bvid([bvid])
         try:
-            notes = self._open_watched_notes(bvid, row[1], limit=360)
+            notes = self._open_watched_notes(bvid, row[1], limit=min(1200, limit))
         except Exception:
             return None
         return {
@@ -1438,7 +1437,7 @@ class BiliWatcher:
                     text = f"{label} · {pick.bvid}\n{summary}"
                     preferred = private.source if private is not None else None
                     if private is not None and (
-                        not authorize(preferred.model_copy(update={"addressed": True}), self.s)
+                        not permits_chat_export(preferred, self.s, "bilibili_surf")
                         or await self.svc.sessions.current_epoch(preferred) != private.epoch
                     ):
                         raise Rejected("bili_private_request_revoked")
@@ -1455,11 +1454,17 @@ class BiliWatcher:
                         {
                             "bvid": pick.bvid,
                             "learning_seconds": max(0, learned_at - learning_start),
+                            "activity_kind": "video_learning",
                             **(
                                 {
                                     "private_first": True,
                                     "owner_private": share_owner,
-                                    "audience": private_event_audience(self.s, preferred.user_id),
+                                    "audience": private_event_audience(
+                                        self.s,
+                                        preferred.user_id,
+                                        platform=preferred.platform,
+                                        bot_id=preferred.bot_id,
+                                    ),
                                 }
                                 if preferred is not None
                                 else {"title": title_str[:80], "summary": summary[:140]}
@@ -1511,13 +1516,19 @@ class BiliWatcher:
                         await ws_mgr.publish_event(
                             *event_args[:3], importance=event_args[3], business_key=pick.bvid
                         )
-                    if self.svc.diary and preferred is None:
-                        await self.svc.diary.patrol("bili-account:" + pick.bvid, text)
-                    if self.s.owner_qq_id and (preferred is None or share_owner):
+                    report_target = owner_target(
+                        self.s, self.s.owner_delivery_platform, learned_at, "patrol-report"
+                    )
+                    if report_target and (
+                        preferred is None
+                        or (
+                            share_owner
+                            and self.store.session_scope(preferred)
+                            == self.store.session_scope(report_target)
+                        )
+                    ):
                         await self.store.save_report(
-                            self.store.subject(self.svc.proactive.target()),
-                            text,
-                            public=preferred is None,
+                            self.store.subject(report_target), text, public=preferred is None
                         )
                     completed += 1
                     if stop_for_risk:

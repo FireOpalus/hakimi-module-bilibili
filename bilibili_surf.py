@@ -33,6 +33,7 @@ class BilibiliSurfModule(BaseModule):
         ThinkingScene("bili_selection", "候选挑选", output_tokens=1536),
         ThinkingScene("bili_learning", "学习心得", output_tokens=4096),
     )
+    admin_panel = "bili"
     display_name = "B 站巡逻"
     description = "账号、视频订阅与巡逻日记"
     schedule_options = BiliScheduleOptions
@@ -75,6 +76,7 @@ class BilibiliSurfModule(BaseModule):
                 name="bili.patrol",
                 description="按既有订阅、凭证、冷却及预算执行一轮巡逻",
                 budget_lane=PATROL_LANE,
+                effortful=True,
                 window="active",
                 quotas=(ActivityQuota("bili_patrols", "bili_patrols_unlimited"),),
                 run=self.patrol,
@@ -142,6 +144,27 @@ class BilibiliSurfModule(BaseModule):
         if self.backend_mode == "remote_node":
             return await self.get_sensor_summary()
         return (await self.dispatch_goal({"id": ticket["id"], "action_type": "status"})).summary
+
+    async def current_activity(self):
+        if not self.watcher:
+            return None
+        store = self.watcher.store
+        async with store.lock:
+            ready = await store.one("SELECT 1 FROM sqlite_master WHERE name='bili_patrol_runs'")
+            working = ready and await store.one(
+                "SELECT 1 FROM bili_patrol_runs WHERE status='working' LIMIT 1"
+            )
+        return "bili_patrol" if working else None
+
+    async def public_patrol_entry(self, event):
+        if event.event_type not in {"bili_video_watched", "bili_mc_inspiration"}:
+            return None
+        bvid = event.payload.get("bvid", "")
+        entry = None
+        if self.watcher and not event.payload.get("private_first"):
+            entry = await self.watcher.lookup_watched(bvid, limit=1200)
+        # The same business key was used by the pre-event diary writer.
+        return "bili-account:" + bvid, entry["prior_patrol_notes"] if entry else ""
 
     async def context_data(self, *, limit: int, now: float, message: Message | None = None) -> dict:
         if self.watcher:
