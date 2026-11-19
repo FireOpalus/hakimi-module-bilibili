@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from ..budget_policy import PATROL_LANE
 from ..config import Settings
 from ..security import Rejected
+from ..thinking_policy import ThinkingScene
 from .actions import Action, ActionCall, Outcome
 from .base import AttentionLevel, BaseModule, GoalResult, NodeRegion, sanitize_sensor_text
 from .bili_schedule import BiliScheduleOptions
@@ -27,6 +28,11 @@ class BilibiliSurfModule(BaseModule):
     """Wraps local BiliWatcher/Bilibili or delegates to a remote CN node fetcher."""
 
     module_id: str = "bilibili_surf"
+    thinking_scenes = (
+        ThinkingScene("bilibili_summary", "视频摘要", output_cap="summary_output_tokens"),
+        ThinkingScene("bili_selection", "候选挑选", output_tokens=1536),
+        ThinkingScene("bili_learning", "学习心得", output_tokens=4096),
+    )
     display_name = "B 站巡逻"
     description = "账号、视频订阅与巡逻日记"
     schedule_options = BiliScheduleOptions
