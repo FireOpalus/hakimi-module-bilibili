@@ -7,7 +7,6 @@ WBI references: docs/BILI_ACCOUNT.md. Source content never selects a URL or tool
 
 import asyncio
 import base64
-import hashlib
 import inspect
 import json
 import logging
@@ -19,11 +18,49 @@ import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import SecretStr
+
+from hakimi_plugin_sdk.bili_common import (
+    API_ORIGIN,
+    BVID,
+    COOKIE_NAMES,
+    COVER_URL_RE,
+    CREDENTIAL_KEYS,
+    GET_PATHS,
+    MAX_COVER_THUMB_BYTES,
+    MIXIN_KEY_ENC_TAB,
+    POST_PATHS,
+    PRIVATE_SHARE_PRIORITY_SECONDS,
+    PUBLIC_DEGRADE_ERRORS,
+    PUBLIC_READ_PATHS,
+    RISK_CODES,
+    RISK_COOLDOWN_SECONDS,
+    SPI_PATH,
+    SUBTITLE_HOSTS,
+    USER_AGENT,
+    BiliPolicy,
+    CredentialUpdate,
+    Pick,
+    Selection,
+    has_voucher,
+    subtitle_text,
+    subtitle_timestamp,
+    validate_cookie,
+    video_duration,
+)
+from hakimi_plugin_sdk.bili_common import (
+    validate_subtitle_url as _common_validate_subtitle_url,
+)
+from hakimi_plugin_sdk.bili_common import (
+    wbi_keys as _common_wbi_keys,
+)
+from hakimi_plugin_sdk.bili_common import (
+    wbi_sign as _common_wbi_sign,
+)
 
 from ..bot_server import is_persona_owner, untrusted_input
 from ..budget_policy import PATROL_LANE, paid_lane_available
@@ -36,9 +73,7 @@ from ..work_usage import model_work
 from ..world_state import private_event_audience
 from .bili_history import SCHEMA as HISTORY_SCHEMA
 from .bili_history import WatchHistory
-from .bilibili import BVID, NODE_TRANSPORT_ERRORS, bounded_json
-
-PRIVATE_SHARE_PRIORITY_SECONDS = 24 * 3600
+from .bilibili import NODE_TRANSPORT_ERRORS, bounded_json
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS bili_credentials (
@@ -71,144 +106,11 @@ CREATE TABLE IF NOT EXISTS bili_actions (
  status TEXT NOT NULL, created REAL NOT NULL, UNIQUE(bvid,kind)
 );
 """
-MIXIN = (
-    46,
-    47,
-    18,
-    2,
-    53,
-    8,
-    23,
-    32,
-    15,
-    50,
-    10,
-    31,
-    58,
-    3,
-    45,
-    35,
-    27,
-    43,
-    5,
-    49,
-    33,
-    9,
-    42,
-    19,
-    29,
-    28,
-    14,
-    39,
-    12,
-    38,
-    41,
-    13,
-    37,
-    48,
-    7,
-    16,
-    24,
-    55,
-    40,
-    61,
-    26,
-    17,
-    0,
-    1,
-    60,
-    51,
-    30,
-    4,
-    22,
-    25,
-    54,
-    21,
-    56,
-    59,
-    6,
-    63,
-    57,
-    62,
-    11,
-    36,
-    20,
-    34,
-    44,
-    52,
-)
-GET_PATHS = frozenset(
-    {
-        "/x/web-interface/nav",
-        "/x/web-interface/wbi/index/top/feed/rcmd",
-        "/x/polymer/web-dynamic/v1/feed/all",
-        "/x/web-interface/view",
-        "/x/player/wbi/v2",
-        "/x/v2/reply",
-        "/x/web-interface/archive/relation",
-        "/x/v3/fav/folder/created/list-all",
-    }
-)
-POST_PATHS = frozenset({"/x/web-interface/archive/like", "/x/v3/fav/resource/deal"})
-PUBLIC_READ_PATHS = frozenset(
-    {"/x/web-interface/nav", "/x/web-interface/view", "/x/player/wbi/v2", "/x/v2/reply"}
-)
-CREDENTIAL_KEYS = ("sessdata", "bili_jct", "buvid3", "buvid4")
-COOKIE_NAMES = {
-    "sessdata": "SESSDATA",
-    "bili_jct": "bili_jct",
-    "buvid3": "buvid3",
-    "buvid4": "buvid4",
-}
-USER_AGENT = "HakimiSurf/0.4 text patrol"
-SPI_PATH = "/x/frontend/finger/spi"
-COVER_URL_RE = re.compile(
-    r"^https://(?:i[0-2]\.hdslb\.com|archive\.biliimg\.com)/bfs/[A-Za-z0-9_./-]+$"
-)
-MAX_COVER_THUMB_BYTES = 98_304
+MIXIN = MIXIN_KEY_ENC_TAB
 
 
 def secret_value(value):
     return value.get_secret_value() if hasattr(value, "get_secret_value") else str(value or "")
-
-
-def validate_cookie(value):
-    if (
-        not isinstance(value, str)
-        or len(value) > 4096
-        or any(ord(c) < 33 or ord(c) > 126 or c in ";\r\n" for c in value)
-    ):
-        raise ValueError("Paste only the cookie value, not the complete Cookie header")
-    return value
-
-
-class BiliPolicy(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-    enabled: bool = False
-    allow_like: bool = False
-    allow_favorite: bool = False
-    favorite_folder_id: str = Field(default="", pattern=r"^[1-9][0-9]{0,19}$|^$")
-    daily_action_limit: int = Field(default=1, ge=1, le=2)
-
-    @model_validator(mode="after")
-    def folder_required(self):
-        if self.allow_favorite and not self.favorite_folder_id:
-            raise ValueError("An explicit owned favorite folder is required")
-        return self
-
-
-class CredentialUpdate(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
-    sessdata: str = ""
-    bili_jct: str = ""
-    buvid3: str = ""
-    buvid4: str = ""
-    clear: bool = False
-
-    @field_validator(*CREDENTIAL_KEYS)
-    @classmethod
-    def valid(cls, value):
-        return validate_cookie(value)
 
 
 @dataclass(frozen=True)
@@ -220,105 +122,55 @@ class PrivateVideoTopic:
     priority: tuple[int, float, int]
 
 
-class Pick(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    bvid: str = Field(pattern="^" + BVID + "$")
-    like: bool = False
-    favorite: bool = False
-    share_owner: bool = False
-    private_topic_ref: str = Field(default="", max_length=48)
-
-
-class Selection(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    selected: list[Pick] = Field(max_length=2)
-    mood_longnick: str = Field(default="", max_length=80)
-
-
 def wbi_sign(params, keys, now):
-    raw = "".join(keys)
-    if not re.fullmatch("[a-fA-F0-9]{64}", raw):
-        raise Rejected("bili_wbi_unavailable")
-    mixin = "".join(raw[index] for index in MIXIN)[:32]
-    values = {**params, "wts": str(int(now))}
-    values = {k: re.sub("[!'()*]", "", str(v)) for k, v in sorted(values.items())}
-    values["w_rid"] = hashlib.md5((urlencode(values, quote_via=quote) + mixin).encode()).hexdigest()
-    return values
+    return _common_wbi_sign(params, keys, now, error_cls=Rejected)
 
 
-def has_voucher(value):
-    if isinstance(value, dict):
-        return bool(value.get("v_voucher")) or any(has_voucher(v) for v in value.values())
-    if isinstance(value, list):
-        return any(has_voucher(v) for v in value)
-    return False
-
-
-def video_duration(value):
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    try:
-        return float(value) if math.isfinite(value) and value > 0 else None
-    except OverflowError:
-        return None
-
-
-def subtitle_timestamp(value):
-    if value == 0 and not isinstance(value, bool):
-        return 0.0
-    return video_duration(value)
-
-
-def subtitle_text(body, duration):
-    """Bound text without describing a clipped or untimed transcript as complete."""
-    lines = body.get("body") if isinstance(body, dict) else None
-    if not isinstance(lines, list) or not lines:
-        return "", False, "unavailable"
-    parts, starts, ends = [], [], []
-    valid = True
-    for line in lines[:1000]:
-        if not isinstance(line, dict) or not isinstance(line.get("content"), str):
-            valid = False
-            continue
-        text = clean_text(line["content"])
-        if text:
-            parts.append(text)
-        start, end = subtitle_timestamp(line.get("from")), subtitle_timestamp(line.get("to"))
-        if (
-            start is None
-            or end is None
-            or end <= start
-            or (duration is not None and end > duration + 5)
-        ):
-            valid = False
-        else:
-            starts.append(start)
-            ends.append(end)
-    text = " ".join(parts)
-    clipped = len(lines) > 1000 or len(text) > 12000
-    text = text[:12000]
-    if not text:
-        return "", False, "unavailable"
-    complete = bool(
-        not clipped
-        and valid
-        and duration is not None
-        and ends
-        and min(starts) <= max(5, duration * 0.05)
-        and max(ends) >= min(duration - 5, duration * 0.95)
-    )
-    return text, complete, "truncated" if clipped else "complete" if complete else "partial"
+wbi_sign.__wrapped__ = _common_wbi_sign  # type: ignore[attr-defined]
 
 
 def wbi_keys(data):
-    keys = []
-    for name in ("img_url", "sub_url"):
-        url = data.get("wbi_img", {}).get(name, "")
-        key = urlsplit(url).path.rsplit("/", 1)[-1].split(".")[0]
-        if not re.fullmatch("[a-fA-F0-9]{32}", key):
-            raise Rejected("bili_wbi_unavailable")
-        keys.append(key)
-    return tuple(keys)
+    return _common_wbi_keys(data, error_cls=Rejected)
+
+
+wbi_keys.__wrapped__ = _common_wbi_keys  # type: ignore[attr-defined]
+
+
+__all__ = [
+    "API_ORIGIN",
+    "BVID",
+    "COOKIE_NAMES",
+    "COVER_URL_RE",
+    "CREDENTIAL_KEYS",
+    "GET_PATHS",
+    "HISTORY_SCHEMA",
+    "MAX_COVER_THUMB_BYTES",
+    "MIXIN",
+    "POST_PATHS",
+    "PRIVATE_SHARE_PRIORITY_SECONDS",
+    "PUBLIC_DEGRADE_ERRORS",
+    "PUBLIC_READ_PATHS",
+    "RISK_CODES",
+    "RISK_COOLDOWN_SECONDS",
+    "SCHEMA",
+    "SPI_PATH",
+    "SUBTITLE_HOSTS",
+    "USER_AGENT",
+    "BiliPolicy",
+    "BiliWatcher",
+    "CredentialUpdate",
+    "Pick",
+    "PrivateVideoTopic",
+    "Selection",
+    "has_voucher",
+    "secret_value",
+    "subtitle_text",
+    "subtitle_timestamp",
+    "validate_cookie",
+    "video_duration",
+    "wbi_keys",
+    "wbi_sign",
+]
 
 
 class BiliWatcher:
@@ -592,7 +444,7 @@ class BiliWatcher:
                 obj = await bounded_json(
                     self.http,
                     "GET",
-                    "https://api.bilibili.com" + SPI_PATH,
+                    API_ORIGIN + SPI_PATH,
                     headers=self._headers(),
                     max_bytes=16384,
                     timeout=5,
@@ -603,7 +455,7 @@ class BiliWatcher:
                 await self._risk("bili_account_risk")
             obj = None
         except Rejected as exc:
-            if str(exc) in {"bili_account_risk", "bili_cookie_expired"}:
+            if str(exc) in RISK_CODES:
                 raise
             # Bad availability or payloads must not make a missing optional cookie mandatory.
             obj = None
@@ -668,7 +520,7 @@ class BiliWatcher:
             return dict(self.creds)
 
     async def _risk(self, reason):
-        self.blocked_until = self.clock() + 43200
+        self.blocked_until = self.clock() + RISK_COOLDOWN_SECONDS
         async with self.store.transaction():
             await self.store.db.execute(
                 "UPDATE bili_account_state SET blocked_until=?,last_error=? WHERE id=1",
@@ -689,18 +541,9 @@ class BiliWatcher:
         if public and (post is not None or (not subtitle and path not in PUBLIC_READ_PATHS)):
             raise Rejected("bili_public_read_only")
         if subtitle:
-            url = urlsplit(path)
-            if (
-                post is not None
-                or url.scheme != "https"
-                or url.hostname
-                not in {"aisubtitle.hdslb.com", "i0.hdslb.com", "i1.hdslb.com", "i2.hdslb.com"}
-                or url.port not in {None, 443}
-                or url.username
-                or url.password
-                or not url.path.startswith("/bfs/")
-            ):
+            if post is not None:
                 raise Rejected("bili_subtitle_host_forbidden")
+            _common_validate_subtitle_url(path, error_cls=Rejected)
         if not subtitle and (path not in (POST_PATHS if post is not None else GET_PATHS)):
             raise Rejected("bili_endpoint_forbidden")
         await self._ensure_request_current()
@@ -712,7 +555,7 @@ class BiliWatcher:
                 await self._ensure_buvid4_locked()
             await self._pace_request()
             headers = self._headers(subtitle=subtitle)
-            url = path if subtitle else "https://api.bilibili.com" + path
+            url = path if subtitle else API_ORIGIN + path
             try:
                 obj = None
                 if self._can_delegate():
@@ -862,16 +705,7 @@ class BiliWatcher:
             return material
         except Rejected as exc:
             # Only source availability failures may degrade; revocation/risk must stop work.
-            if str(exc) not in {
-                "bili_account_unavailable",
-                "bili_account_upstream_error",
-                "bili_video_schema_changed",
-                "bili_video_mismatch",
-                "bili_wbi_unavailable",
-                "bili_subtitle_host_forbidden",
-                "redirect_not_allowed",
-                "upstream_body_too_large",
-            }:
+            if str(exc) not in PUBLIC_DEGRADE_ERRORS:
                 raise
             await self._ensure_request_current()
             fallback["material_error"] = str(exc)
@@ -968,17 +802,7 @@ class BiliWatcher:
             )
             url = str(sub.get("subtitle_url", ""))
             url = "https:" + url if url.startswith("//") else url
-            u = urlsplit(url)
-            if (
-                u.scheme != "https"
-                or u.hostname
-                not in {"aisubtitle.hdslb.com", "i0.hdslb.com", "i1.hdslb.com", "i2.hdslb.com"}
-                or u.port not in {None, 443}
-                or u.username
-                or u.password
-                or not u.path.startswith("/bfs/")
-            ):
-                raise Rejected("bili_subtitle_host_forbidden")
+            _common_validate_subtitle_url(url, error_cls=Rejected)
             try:
                 body = await self._request(url, subtitle=True)
                 transcript, complete, subtitle_status = subtitle_text(body, duration)

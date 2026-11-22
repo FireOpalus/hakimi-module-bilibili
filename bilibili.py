@@ -2,46 +2,47 @@ import asyncio
 import logging
 import re
 import time
-from urllib.parse import urlsplit
 
 import httpx
+
+from hakimi_plugin_sdk.bili_common import (
+    API_ORIGIN,
+    BV_RE,
+    BVID,
+    BVID_RE,
+    LIVE_API_ORIGIN,
+    MID_RE,
+    PUBLIC_USER_AGENT,
+    URL_RE,
+    extract_bvid,
+    extract_url_bvid,
+    extract_video_ref,
+)
 
 from ..config import Settings
 from ..http_json import bounded_json
 from ..models import Video
 from ..security import Rejected, clean_text
 
-BVID = r"BV[1-9A-HJ-NP-Za-km-z]{10}"
-BV_RE = re.compile(rf"(?<![A-Za-z0-9])({BVID})(?![A-Za-z0-9])")
-URL_RE = re.compile(r"https?://[^\s<>\"'，。！？）]+", re.IGNORECASE)
-API_ORIGIN = "https://api.bilibili.com"
 NODE_TRANSPORT_ERRORS = frozenset(
     {"node_disconnected", "node_not_dispatched", "node_rpc_timeout", "node_unavailable"}
 )
 
-
-def extract_bvid(text: str) -> str | None:
-    urls = URL_RE.findall(text)
-    candidates = []
-    for raw in urls:
-        try:
-            u = urlsplit(raw)
-            if (
-                u.scheme != "https"
-                or u.hostname not in {"www.bilibili.com", "bilibili.com", "m.bilibili.com"}
-                or u.username
-                or u.password
-                or u.port not in {None, 443}
-            ):
-                continue
-            match = re.fullmatch(rf"/video/({BVID})/?", u.path)
-            if match:
-                candidates.append(match[1])
-        except ValueError:
-            continue
-    if not candidates:
-        candidates = BV_RE.findall(URL_RE.sub(" ", text))
-    return candidates[0] if candidates else None
+__all__ = [
+    "API_ORIGIN",
+    "BVID",
+    "BVID_RE",
+    "BV_RE",
+    "LIVE_API_ORIGIN",
+    "MID_RE",
+    "NODE_TRANSPORT_ERRORS",
+    "URL_RE",
+    "Bilibili",
+    "Video",
+    "bounded_json",
+    "extract_bvid",
+    "extract_video_ref",
+]
 
 
 class Bilibili:
@@ -110,10 +111,10 @@ class Bilibili:
                     result = await bounded_json(
                         self.http,
                         "GET",
-                        ("https://api.live.bilibili.com" if live else API_ORIGIN) + path,
+                        (LIVE_API_ORIGIN if live else API_ORIGIN) + path,
                         params=params,
                         headers={
-                            "User-Agent": "HakimiSurf/0.1 (public metadata reader)",
+                            "User-Agent": PUBLIC_USER_AGENT,
                             "Referer": "https://www.bilibili.com/",
                         },
                     )
@@ -152,7 +153,7 @@ class Bilibili:
             return result["data"]
 
     async def live_info(self, room_id: str) -> dict:
-        if not re.fullmatch(r"[1-9][0-9]{0,19}", room_id):
+        if not MID_RE.fullmatch(room_id):
             raise Rejected("invalid_room_id")
         data = await self._get(
             "/room/v1/Room/get_info", {"room_id": room_id}, "live:" + room_id, 60, live=True
@@ -171,7 +172,7 @@ class Bilibili:
         return (await self.live_info(room_id))["live_status"]
 
     async def video(self, bvid: str) -> Video:
-        if not re.fullmatch(BVID, bvid):
+        if not BVID_RE.fullmatch(bvid):
             raise Rejected("invalid_bvid")
         data = await self._get("/x/web-interface/view", {"bvid": bvid}, bvid, 600)
         try:
@@ -224,7 +225,7 @@ class Bilibili:
                     if not isinstance(resp, dict):
                         self.blocked_until = time.monotonic() + 900
                         raise Rejected("bilibili_short_link_unavailable")
-                    bvid = extract_bvid(str(resp.get("location") or ""))
+                    bvid = extract_url_bvid(str(resp.get("location") or "").strip())
                     if not bvid:
                         raise Rejected("bilibili_short_link_target_forbidden")
                     return bvid
@@ -232,13 +233,13 @@ class Bilibili:
                 if response.status_code not in {301, 302, 303, 307, 308}:
                     self.blocked_until = time.monotonic() + 900
                     raise Rejected("bilibili_short_link_unavailable")
-                bvid = extract_bvid(response.headers.get("location", ""))
+                bvid = extract_url_bvid(response.headers.get("location", "").strip())
                 if not bvid:
                     raise Rejected("bilibili_short_link_target_forbidden")
                 return bvid
 
     async def updates(self, mid: str) -> list[Video]:
-        if not re.fullmatch(r"[1-9][0-9]{0,19}", mid):
+        if not MID_RE.fullmatch(mid):
             raise Rejected("invalid_mid")
         data = await self._get(
             "/x/polymer/web-dynamic/v1/feed/space", {"host_mid": mid}, "up:" + mid, 600
